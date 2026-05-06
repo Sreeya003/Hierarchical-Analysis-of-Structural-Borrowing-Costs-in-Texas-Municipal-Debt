@@ -1,0 +1,499 @@
+---
+title: "6301_finalproject"
+author: "Venkata Satya Sreeya Chandrapati"
+date: "2026-04-24"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# Required Libraries for Project
+suppressWarnings(
+  suppressPackageStartupMessages({
+
+  # Data manipulation
+  library(dplyr)
+  library(tidyr)
+  library(tidyverse)
+  library(janitor)
+  library(lubridate)
+  library(naniar)
+  library(kableExtra)
+
+  # Data import & parsing
+  library(readr)
+
+  # Data visualization
+  library(ggplot2)
+
+  # Correlation plots
+  library(corrplot)
+
+  # Statistical modeling
+  library(stats)
+
+  # Regression diagnostics
+  library(car)
+  library(lmtest)
+  library(sandwich)
+
+  # Model output formatting
+  library(broom)
+  library(knitr)
+  library(kableExtra)
+
+  # Data transformation
+  library(scales)
+
+  # Time handling 
+  library(lubridate)
+
+  # Panel data
+  library(plm)
+
+  # Advanced visualization
+  library(GGally)
+  library(reshape2)
+
+  # ML / Regularization
+  library(Matrix)
+  library(glmnet)
+
+})
+)
+```
+
+
+# Section 1: RESEARCH FRAMEWORK AND MATHEMATICAL FORMULATION
+
+## 1.1 Research Question
+**To what extent do 'Pledge Type' and 'Issue Purpose' influence the interest-to-principal ratio of Texas local debt, and how does this relationship vary across different 'Government Types'?**
+
+## 1.2 Theoretical Justification
+This study utilizes an econometric framework to analyze municipal debt efficiency. We ground our analysis in two primary pillars:  
+1. **Credit Risk Premium Theory (Fama & French, 1993):** We hypothesize that security structures—specifically General Obligation (GO) vs. Revenue (REV) pledges—create a risk-based pricing differential.  
+2. **Institutional Risk Frameworks (Hildreth & Zorn, 2005):** We posit that the "borrowing cost" is not solely a market-driven figure but is moderated by the institutional nature of the issuer (e.g., School Districts vs. Cities).
+
+## 1.3 The Dependent Variable: Interest Burden Ratio ($IPR$)
+To standardize the cost of debt across varying loan sizes, we define the **Interest-to-Principal Ratio ($IPR$)** as our primary outcome variable:
+
+$$IPR_{ij} = \frac{\text{Total Interest Outstanding}_{ij}}{\text{Total Principal Outstanding}_{ij}}$$
+
+*Where $i$ denotes the specific issuance and $j$ denotes the government entity.*
+
+## 1.4 Mathematical Specification: Linear Mixed-Effects Model (LMM)
+A standard OLS regression assumes the independence of observations. However, our data is **nested** (multiple issuances per government type). Ignoring this clustering leads to underestimated standard errors and inflated Type I error rates (**Moulton, 1986**). We will utilize the `lme4` package in R to estimate a **Random Intercept Model**.
+
+### Level 1: Issuance Level (Fixed Effects)
+$$y_{ij} = \beta_{0j} + \beta_{1}(\text{PledgeType})_{ij} + \beta_{2}(\text{IssuePurpose})_{ij} + \beta_{3}\log(\text{TotalPrincipal})_{ij} + \epsilon_{ij}$$
+
+* **$\beta_{1}, \beta_{2}$**: Capture the structural impact of the pledge and purpose.
+* **$\beta_{3}$**: Controls for the "Size Effect." We use the natural logarithm of the principal to stabilize variance and handle the highly skewed distribution of loan amounts.
+* **$\epsilon_{ij}$**: The residual error, where $\epsilon_{ij} \sim N(0, \sigma^2)$.
+
+### Level 2: Entity/Type Level (Random Intercepts)
+$$\beta_{0j} = \gamma_{00} + \gamma_{01}(\text{GovernmentType})_j + u_{0j}$$
+
+* **$\gamma_{00}$**: The grand mean interest burden across Texas.
+* **$u_{0j}$**: The random effect for each government group, where $u_{0j} \sim N(0, \tau^2)$. This captures the unobserved financial health or market perception specific to that government type.  
+  
+  
+# Section 2: DATA ACQUISITION AND STRUCTURAL INSPECTION
+
+In this section, we programmatically ingest the Texas Bond Review Board dataset and perform a rigorous structural audit. Here, we ensure that each issuance is a row and each financial attribute is a correctly typed variable.  
+
+## 2.1. Data Loading & Structuraal Integrity Audit:  
+```{r}
+# Read dataset
+raw_data <- read_csv("Debt_Outstanding_By_Issuance_Local_20260403.csv") %>% 
+  clean_names() # Ensures snake_case for R compatibility
+
+# Check dimensions and data types
+glimpse(raw_data)
+
+# Verify uniqueness: Does each row represent a unique issuance?
+# Often, 'issuance_name' combined with 'closing_date' serves as a composite key.
+duplicate_count <- raw_data %>%
+  get_dupes(issuance_name, closing_date, total_principal_outstanding) %>%
+  nrow()
+
+cat("Number of duplicate records detected:", duplicate_count)
+
+# Cleaning the duplicates
+raw_data <- raw_data %>% distinct()
+```
+  
+## 2.2. Data Type Transformation:  
+In finance data science, date-time and categorical variables must be explicitly cast to ensure the lme4 engine interprets them correctly.  
+  
+```{r}
+df_clean <- raw_data %>%
+  mutate(
+    # Convert dates using lubridate
+    closing_date = mdy(closing_date),
+    last_principal_payment = mdy(last_principal_payment),
+    
+    # Cast categorical variables as Factors for Mixed Modeling
+    government_type = as.factor(government_type),
+    pledge_type = as.factor(pledge_type),
+    issue_purpose = as.factor(issue_purpose),
+    
+    # Financial normalization (preventing scientific notation issues)
+    total_principal_outstanding = as.numeric(total_principal_outstanding),
+    total_interest_outstanding = as.numeric(total_interest_outstanding)
+  ) %>%
+  # Filter out 'Zombie Debt' (loans with zero principal) to avoid division by zero
+  filter(total_principal_outstanding > 0)
+```
+  
+## 2.3. Missingness Analysis:  
+```{r}
+# Visualize missing data patterns
+gg_miss_var(df_clean) + 
+  labs(title = "Missingness Audit per Feature")
+```
+  
+Because there are no missing values, we can proceed with our next section.  
+  
+# Section 3: Feature Engineering and Exploratory Data Analysis (EDA)
+
+This phase focuses on deriving our primary metric of interest and validating the distributional assumptions necessary for Hierarchical Linear Modeling.
+
+## 3.1 Feature Engineering: Interest-to-Principal Ratio ($IPR$)
+We calculate the $IPR$, which serves as a proxy for the structural cost of debt. We also apply a log-transformation to `total_principal_outstanding` to account for the "Size Effect" and reduce the impact of extreme values (outliers).
+
+```{r engineering}
+df_final <- df_clean %>%
+  mutate(
+    # Derive dependent variable
+    ipr = total_interest_outstanding / total_principal_outstanding,
+    
+    # Log-transform independent variable to handle skewness
+    log_principal = log(total_principal_outstanding)
+  ) %>%
+  # Remove outliers that could bias the LMM: IPR > 2.0 (rare for muni bonds)
+  filter(ipr > 0 & ipr < 2.0)
+
+#Distributional Diagnostics of the Dependent Variable
+library(patchwork)
+#Distribution of Interest-to-Principal Ratio
+p1 <- ggplot(df_final, aes(x = ipr)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "white") +
+  theme_minimal() +
+  labs(title = "Distribution of Interest-to-Principal Ratio", x = "IPR", y = "Count")
+#Normal Q-Q Plot of IPR
+p2 <- ggplot(df_final, aes(sample = ipr)) +
+  stat_qq() + stat_qq_line(color = "red") +
+  theme_minimal() +
+  labs(title = "Normal Q-Q Plot of IPR")
+
+p1 + p2
+
+#Visualizing Categorical Predictors (Grouped Heterogeneity)
+ggplot(df_final, aes(x = fct_reorder(government_type, ipr), y = ipr, fill = pledge_type)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Interest Burden by Government Type and Pledge Type",
+    x = "Government Entity",
+    y = "IPR",
+    fill = "Pledge Type"
+  )
+```
+## Distributional Analysis Commentary
+Statistical Interpretation: The histogram reveals a significant positive skew (right-skewed) in the Interest-to-Principal Ratio ($IPR$), which is a common characteristic of financial yield data. This is further corroborated by the Normal Q-Q Plot, which exhibits a strong upward curvature at the theoretical quantiles. This "heavy-tailed" or leptokurtic behavior indicates that the data violates the Gaussian assumption of normality.
+
+Methodological Implications: From a researcher’s perspective (e.g., Cook & Weisberg, 1983), applying a standard OLS or Gaussian-linked Mixed Model to raw $IPR$ would likely result in biased standard errors and inefficient estimates. The non-normality at the tails suggests that the model may benefit from a Logarithmic Transformation or the use of a Gamma Generalized Linear Mixed Model (GLMM) with a log link, which is better suited for continuous, non-negative financial ratios (Ferrari & Cribari-Neto, 2004).
+
+## Visualizing Grouped Heterogeneity Commentary
+
+Financial Theory Context: The boxplot analysis provides strong visual support for the Credit Risk Premium hypothesis. Across most government entities—notably COUNTY and CITY—Revenue (REV) bonds consistently exhibit higher median $IPR$ values and wider interquartile ranges (IQR) compared to General Obligation (GO) bonds. This suggests that investors demand a higher "yield-to-principal" to compensate for the narrower revenue-stream pledge compared to the broad taxing power of GO bonds.
+
+
+Justification for Hierarchical Modeling: There is clear evidence of Unobserved Heterogeneity across government types. For instance, ISDs (Independent School Districts) show much tighter distributions and lower medians than WD (Water Districts), likely reflecting different regulatory environments and state-level credit enhancements (such as the Texas Permanent School Fund).Econometric Conclusion: The variance in both the "baseline" (intercepts) and the "spread" (slopes) across these categories mathematically justifies the use of a Linear Mixed-Effects Model (LMM). A simple OLS would fail to account for this clustering, leading to the Moulton Factor problem where standard errors are underestimated because the model assumes issuances from the same government type are independent, when they are clearly structurally related.
+
+
+# Section 3.4: Advanced Diagnostic EDA
+
+Beyond simple distributions, we must investigate the structural relationships between debt volume, time, and borrowing costs to ensure our regression model is not confounded by scale or temporal shifts.
+
+## 3.1: The "Size Effect" and Economies of Scale
+In municipal finance, the **Size Effect** posits that larger issuances benefit from higher liquidity and lower transaction costs (**Capeci, 1994**). We use a scatter plot with a non-linear smoother (LOESS) to visualize if the $IPR$ decreases as the `log(Total Principal)` increases.
+
+```{r size_effect, fig.height=5, fig.width=8}
+ggplot(df_final, aes(x = log_principal, y = ipr)) +
+  geom_point(alpha = 0.1, color = "darkblue") +
+  geom_smooth(method = "loess", color = "red", size = 1) +
+  theme_minimal() +
+  labs(
+    title = "Interest Burden vs. Issuance Size (Log Scale)",
+    subtitle = "Testing for Economies of Scale in Municipal Borrowing",
+    x = "Log(Total Principal Outstanding)",
+    y = "IPR"
+  )
+
+df_final %>%
+  mutate(closing_year = year(closing_date)) %>%
+  group_by(closing_year, pledge_type) %>%
+  summarise(mean_ipr = mean(ipr), .groups = 'drop') %>%
+  ggplot(aes(x = closing_year, y = mean_ipr, color = pledge_type)) +
+  geom_line(size = 1) +
+  geom_point() +
+  theme_minimal() +
+  labs(
+    title = "Average Interest Burden by Closing Year",
+    x = "Year of Loan Closing",
+    y = "Mean IPR",
+    color = "Pledge Type"
+  )
+
+#Multicollinearity Check: Purpose vs. Pledge
+df_final %>%
+  count(issue_purpose, pledge_type) %>%
+  group_by(issue_purpose) %>%
+  mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = pledge_type, y = fct_reorder(issue_purpose, n), fill = prop)) +
+  geom_tile() +
+  scale_fill_gradient(low = "#EAEA1A", high = "#E82913") +
+  theme_minimal() +
+  labs(
+    title = "Heatmap of Issue Purpose vs. Pledge Type",
+    subtitle = "Checking for Structural Overlap (Multicollinearity Risk)",
+    x = "Pledge Type",
+    y = "Issue Purpose",
+    fill = "Proportion"
+  )
+```
+
+## Economies of Scale (Size Effect) Analysis
+Statistical Interpretation: The scatter plot reveals a surprising non-linear relationship between issuance size and the interest-to-principal ratio ($IPR$), rather than a linear decrease. While economies of scale are visible for smaller loans (up to approx. $e^{12}$ in log-principal), there is a distinct upward trend for very large-scale issuances ($ > e^{16}$).
+
+Theoretical Context: This contradicts the simplistic "liquidity premium" theory. In financial econometrics, this is often explained as Market Saturation or Concentration Risk. According to Simonsen et al. (2001), as the size of a single issuance grows extremely large, the supply of capital from a single region may become exhausted, forcing the issuer to offer higher yields to attract national or institutional buyers.
+
+Methodological Implication: The LOESS smoother confirms that the relationship is non-linear. Consequently, in our regression model, we should treat log(TotalPrincipal) with care—potentially testing for a quadratic term ($LogPrincipal^2$) to capture this "optimal size" phenomenon and avoid Functional Form Misspecification.
+
+## Temporal Vintage Analysis
+
+Economic Interpretation: The time-series plot shows a significant and sharp increase in the mean $IPR$ starting around 2021-2022. This correlates perfectly with the Federal Reserve's aggressive interest rate hikes to combat post-pandemic inflation.
+
+Financial Risk Perspective: It is noteworthy that while Revenue (REV) bonds consistently carried a premium historically, the spread between REV and General Obligation (GO) bonds has widened significantly in high-interest-rate environments (2023–2025). This suggests that "Revenue-backed" debt is more sensitive to macroeconomic volatility than "Tax-backed" debt.
+
+Master's-Level Insight: This visualization justifies the inclusion of Fiscal Year as a control variable. Failing to account for the "Closing Year" would lead to Omitted Variable Bias, as we might incorrectly attribute high interest costs to a "Pledge Type" when they were actually driven by the global interest rate environment at the time of issuance.
+
+## Multicollinearity & Structural Overlap Audit
+Econometric Diagnostics: The heatmap identifies significant Structural Sparsity in the dataset. Many "Issue Purpose" categories—such as Prisons/Detention, Pension Obligations, and Computer Technology—are exclusively backed by General Obligation (GO) pledges. Conversely, Toll Roads and Solid Waste show a much higher reliance on Revenue (REV) pledges.
+
+Research Warning: This indicates a high risk of Multicollinearity. Because certain purposes only appear with certain pledges, the model may struggle to isolate the independent effect of PledgeType from IssuePurpose.
+
+Strategy for the Team: To address this, we must check the Variance Inflation Factor (VIF) during model estimation. If the VIF is high, we might need to collapse some of the "Issue Purpose" categories into broader groups (e.g., "Infrastructure" vs. "Administration") to improve model stability and ensure the coefficients for our primary research question remain interpretable.
+
+## 3.7 Pre-Modeling Structural Audit
+
+Before proceeding to formal estimation, we perform a three-point audit to ensure the dataset meets the requirements for a Mixed-Effects framework.
+
+```{r final_audit, fig.height=12, fig.width=10}
+library(patchwork)
+library(car) # For GVIF
+
+# 1. Sparsity Check: N-Count per Level-2 Group
+p_sparsity <- df_final %>%
+  count(government_type) %>%
+  ggplot(aes(x = fct_reorder(government_type, n), y = n)) +
+  geom_col(fill = "midnightblue") +
+  geom_text(aes(label = n), hjust = -0.2, size = 3) +
+  coord_flip() +
+  scale_y_log10() +
+  theme_minimal() +
+  labs(title = "Audit 1: N-Count by Government Type",
+       subtitle = "Checking for group sparsity (Level-2 units)",
+       x = "Entity Type", y = "Log10 Count")
+
+# 2. Leverage Audit: Identifying Influential Outliers within Groups
+p_leverage <- ggplot(df_final, aes(x = government_type, y = ipr)) +
+  geom_boxplot(outlier.shape = NA, fill = "lightgray", alpha = 0.5) +
+  geom_jitter(width = 0.2, alpha = 0.05, color = "darkred") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Audit 2: Distribution and Local Leverage",
+       subtitle = "Identifying influential observations across groups",
+       x = "Entity Type", y = "IPR")
+
+# 3. Collinearity Audit: Pre-Model GVIF Check
+vif_model <- lm(ipr ~ pledge_type + issue_purpose + log_principal, data = df_final)
+
+# Convert to dataframe and handle the non-syntactic column name by position
+vif_data <- as.data.frame(vif(vif_model)) %>%
+  rownames_to_column("Variable") %>%
+  # In the car package output, the adjusted GVIF is always the last (3rd) column
+  rename(GVIF_Adjusted = last_col()) 
+
+p_vif <- ggplot(vif_data, aes(x = fct_reorder(Variable, GVIF_Adjusted), y = GVIF_Adjusted)) +
+  geom_col(fill = "darkgreen") +
+  geom_hline(yintercept = 2, linetype = "dashed", color = "red") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Audit 3: Collinearity Diagnostic (GVIF)",
+       subtitle = "Adjusted GVIF > 2 indicates redundant predictors",
+       x = "Predictor", y = "Adjusted GVIF")
+
+# Combine all three
+(p_sparsity / p_leverage / p_vif) + 
+ plot_annotation(title = "Final Econometric Audit Dashboard",
+                  subtitle = "Assessing Data Suitability for Hierarchical Linear Modeling")
+```
+
+## Group Sparsity Analysis: 
+
+The N-count distribution confirms that our Level-2 grouping variable (government_type) is sufficiently populated for Hierarchical Linear Modeling. While there is a clear imbalance—with Water Districts (WD) and Cities providing the most observations—even our smallest group, Health Districts (HHD), contains 149 observations. This exceeds the minimum threshold (often cited as $n_j > 30$) required to reliably estimate group-level variances ($u_{0j}$) without over-reliance on the grand mean.
+
+## Leverage and Local Variance:
+
+The jittered boxplot identifies that $IPR$ variance is remarkably consistent across entities, though some groups like ISDs and Cities exhibit a "long tail" of high-interest issuances. Crucially, the "Local Leverage" audit shows that the medians are not being pulled by single outliers; rather, the data represents a dense cloud of observations. This justifies the use of Random Intercepts, as we are modeling structural shifts in the "typical" borrowing cost of an entity rather than chasing anomalies.
+
+## Collinearity Diagnostic (GVIF):
+The Adjusted Generalized Variance Inflation Factor (GVIF) for all predictors is near 1.0, well below the conservative threshold of 2.0. This is a significant finding: it proves that PledgeType, IssuePurpose, and log_principal provide independent information to the model. We can proceed with the full model confident that our coefficients for the "REV" vs. "GO" premium will not be "muddy" or unstable due to structural overlap between the variables.
+
+# Section 4: Model Implementation and Comparison
+
+In this section, we transition from descriptive analysis to inferential modeling. We use a "Step-up" approach to justify the complexity of the Hierarchical Linear Model (HLM).
+
+## 4.1 The Null Model (Unconditional Model) and ICC
+The Null Model contains no predictors and serves only to partition the variance between the issuance level and the government-type level. We use this to calculate the **Intraclass Correlation Coefficient (ICC)**.
+
+```{r null_model}
+library(lme4)
+library(performance) # For automated ICC calculation
+
+# Model 0: Intercept-only with Random Effect
+m0_null <- lmer(ipr ~ 1 + (1 | government_type), data = df_final)
+
+# Calculate ICC
+icc_value <- icc(m0_null)
+print(icc_value)
+```
+## Partitioning Variance (ICC Analysis)
+Statistical Interpretation: The Intraclass Correlation Coefficient (ICC) is 0.062 (approximately 6.2%). While seemingly small, in the context of large-scale municipal debt datasets, this indicates that a *non-trivial portion* of the variance in interest burden is purely attributable to the inherent characteristics of the Government Type (Level-2) rather than individual loan features.
+
+Researcher Justification: According to Hox (2010), an ICC above 0.05 is a common threshold for justifying the use of a Multilevel Model. If we had used OLS, we would have ignored this 6% of clustered variance, leading to a violation of the independence assumption and potentially "inflated" significance for our predictors.
+
+## The Baseline: Fixed-Effects OLS Model
+We run a standard OLS model to see what a "naive" analysis would suggest about the Pledge Type premium.
+
+```{r ols}
+cat("OLS Model")
+m1_ols <- lm(ipr ~ pledge_type + issue_purpose + log_principal, data = df_final)
+summary(m1_ols)
+```
+The OLS model provides a "Population Averaged" view. It assumes that every debt issuance in Texas is an independent data point, regardless of which government entity issued it.The Intercept ($\beta_0 = -0.675$): This represents the predicted IPR when all predictors are at their reference levels (e.g., a "GO" pledge for a "Commerce" purpose with a principal of $1). Since we used log_principal, this value is a mathematical anchor rather than a practical cost.The Fixed Effects ($\beta_k$): These are interpreted as the average change in IPR for a one-unit change in the predictor, holding all other variables constant.Example: The coefficient for pledge_typeREV (0.045) suggests that, on average, a Revenue bond increases the interest-to-principal ratio by 0.045 units compared to a General Obligation bond across the entire state.The Error Term ($\epsilon$): OLS assumes that all "unexplained" variance is random noise ($N(0, \sigma^2)$). It ignores the fact that noise might be "lumpy" (clustered) within specific types of governments.
+
+
+## The Full Hierarchical Linear Model (HLM)
+Finally, we implement the Random Intercept Model. This model accounts for the clustering identified in the ICC and provides the most accurate standard errors for our predictors.
+
+```{r hlm}
+m2_hlm <- lmer(ipr ~ pledge_type + issue_purpose + log_principal + (1 | government_type), 
+               data = df_final, REML = TRUE)
+
+# View results with Satterthwaite's method for p-values
+library(lmerTest) 
+summary(m2_hlm)
+```
+
+## Fixed Effects and the Revenue Premium
+
+Analysis of Coefficients: > 
+
+1. The Revenue Premium: In the Full HLM (m2_hlm), the coefficient for pledge_typeREV is 0.0586 ($t = 12.12$). This confirms that Revenue Bonds carry a significantly higher interest burden than General Obligation bonds, even when controlling for the purpose of the loan and the size of the principal. This estimate is highly stable across both the OLS and HLM versions.
+
+2. Economies of Scale: The log_principal coefficient is 0.0668 ($t = 63.173$). Interestingly, the positive coefficient indicates that as the loan size increases, the interest-to-principal ratio also increases. This aligns with our EDA observation of a "Market Saturation" effect for extremely large issuances, where the risk of concentrated exposure overrides the benefits of liquidity.
+
+3. The "Refunding" Discount: We note that issue_purposeRefund has a strong negative coefficient (-0.169), indicating that refinancing old debt consistently results in a lower interest burden—validating the efficiency of Texas local governments in managing debt cycles.
+
+
+## Model Comparison using AIC and BIC
+
+```{r modelcompare}
+anova(m0_null, m2_hlm) # Likelihood Ratio Test
+# Or use the compare_performance from the performance package
+compare_performance(m1_ols, m2_hlm, metrics = "common")
+```
+
+## AIC/BIC: 
+The Full Mixed-Effects Model (m2_hlm) shows a significantly lower AIC (-4791.9) compared to the OLS model (-4566.1). In model selection theory (Burnham & Anderson, 2002), a drop in AIC of $>10$ is considered definitive evidence of a superior model.Explained Variance: The Conditional $R^2$ (0.359) represents the variance explained by both fixed and random effects, while the Marginal $R^2$ (0.324) represents only the fixed effects. The gap between them reinforces the importance of the Government Type in explaining debt costs.Likelihood Ratio Test (LRT): The anova(m0_null, m2_hlm) result with $p < 2.2e-16$ provides the final "accredited" proof that the addition of fixed predictors to the random-intercept framework significantly improves model fit.
+
+# Section 5: Model Validation and Marginal Effects
+
+## 5.1 Residual Diagnostics (Assessing Model Assumptions)
+We evaluate the health of the Hierarchical Linear Model by examining the distribution of the residuals. According to **Schielzeth et al. (2020)**, robust inference in LMMs depends on the normality and homoscedasticity of Level-1 residuals.
+
+```{r diagnostics_hlm, fig.height=8, fig.width=10}
+library(performance)
+library(see) # For professional diagnostic themes
+
+# Generate a diagnostic dashboard for the Mixed Model
+check_model(m2_hlm, check = c("normality", "homogeneity", "reqq"))
+```
+## Model Validation Commentary
+
+1. Homogeneity of Variance (Scale-Location Plot)The plot of standardized residuals against fitted values shows a relatively stable spread. While there is a slight upward curvature in the green reference line at higher fitted values, the "cloud" of data points remains largely contained without a classic "fan" shape (heteroscedasticity).
+
+Statistical Verdict: The log-transformation of the principal successfully mitigated most of the variance instability common in financial debt data. The model satisfies the requirement for Homoscedasticity sufficiently for reliable inference.
+
+2. Normality of Residuals: The density plot shows that the Level-1 residuals are approximately normally distributed and centered at zero. There is a slight "leptokurtic" (peaked) quality and a minor right tail, but it aligns well with the theoretical normal curve (green line).Statistical Verdict: Since our sample size is large ($N > 17,000$), the Central Limit Theorem further protects our $t$-statistics and $p$-values against these minor departures from perfect normality.
+
+3. Normality of Random Effects (Level-2 Q-Q Plot): This is a crucial diagnostic for Hierarchical Linear Modeling. The plot shows the Best Linear Unbiased Predictors (BLUPs) for our 7 government types plotted against theoretical quantiles.
+
+All 7 points fall within or very near the shaded 95% confidence band.
+
+Statistical Verdict: This proves that our assumption that the "Government Type" intercepts follow a normal distribution $u_{0j} \sim N(0, \tau^2)$ is valid. The institutional heterogeneity of Texas is being captured correctly by the random-effects structure.
+
+## Marginal Effects
+
+```{r}
+library(ggeffects)
+
+# Calculate marginal effects for Pledge Type
+marginal_pledge <- predict_response(m2_hlm, terms = "pledge_type")
+
+# Plot
+plot(marginal_pledge) +
+  theme_minimal() +
+  labs(
+    title = "Marginal Effect of Pledge Type on Interest Burden",
+    subtitle = "Predicted IPR holding other covariates constant",
+    x = "Pledge Type",
+    y = "Predicted IPR"
+  )
+```
+1. The Security Premium (GO vs. REV)
+The plot visualizes the clear hierarchical pricing of risk in the Texas municipal market. While holding all other variables (Issue Purpose and Loan Size) at their means, the model predicts that Revenue (REV) bonds incur a significantly higher interest burden (approx. $0.40$ $IPR$) compared to General Obligation (GO) bonds (approx. $0.34$ $IPR$).Master's Analysis: This $\approx 6\%$ difference in the interest-to-principal ratio represents the "pure" premium that investors demand to accept a narrower revenue-stream pledge rather than a broad taxing-power pledge.
+
+2. The Lease Purchase (LP) Anomaly 
+Interestingly, Lease Purchase (LP) agreements exhibit the lowest predicted interest burden (approx. $0.23$ $IPR$), but with the widest confidence intervals.Statistical Context: The large error bars for LP reflect the smaller sample size and higher variance within this category (as seen in our earlier sparsity audit). While they appear "cheaper," the lack of precision suggests that LP pricing is highly specialized and subject to individual contract terms rather than a standardized market rate.
+
+3. Confidence Intervals and Precision
+The narrow confidence intervals for GO and REV pledges indicate that the model has high precision in estimating these costs, likely due to the standardization and high volume of these bond types in the Texas market.
+
+## Random Effects Inspection (Shrinkage Analysis)
+
+```{r}
+library(sjPlot)
+
+plot_model(m2_hlm, type = "re", show.values = TRUE) +
+  theme_minimal() +
+  labs(title = "Random Effects: Deviation by Government Type",
+       subtitle = "Intercept shifts (u0j) relative to the Grand Mean")
+```
+## Random Effects (BLUPs) Interpretation 
+
+1. Quantifying Institutional Deviations ($u_{0j}$)
+The values shown on the plot represent the Best Linear Unbiased Predictors (BLUPs). These are the intercept shifts relative to the grand mean of the model.The "Taxpayer Discount" (CCD & COUNTY): Community College Districts (CCD) and Counties exhibit the most significant negative deviations (-0.07 and -0.06 respectively). This suggests that these entities are viewed by the market as inherently lower risk, likely due to more stable tax bases or broader statutory authority, allowing them to borrow at a lower baseline rate than the average Texas entity.
+
+The "Institutional Premium" (ISD & WD): Conversely, Independent School Districts (ISD) and Water Districts (WD) show positive deviations (+0.05 and +0.04). This indicates a structural "premium" or baseline cost increase for these entities. For ISDs, this is a particularly interesting finding given their high volume, suggesting that the sheer frequency of school debt issuance may create a slight upward pressure on baseline interest ratios.
+
+2. The Concept of Shrinkage (Partial Pooling)Notice the small error bars for WD, CITY, and ISD. Because these groups have very large sample sizes (as seen in our Sparsity Audit), the model is highly confident in their specific intercept shifts.For groups with smaller $n$, the model would pull (or "shrink") the dot closer to the $0.00$ center line. This James-Stein Shrinkage is a hallmark of Hierarchical Modeling, ensuring that we don't overreact to the high interest rates of a single small Health District.
+
+3. Justifying the ICC
+
+The physical spread of these dots along the x-axis visually represents the 6.2% ICC we calculated earlier. If there were no institutional difference, all these dots would be stacked vertically on the $0.00$ line. Their separation proves that "Government Type" is a statistically necessary grouping level.
